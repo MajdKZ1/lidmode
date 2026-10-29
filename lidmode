@@ -1,0 +1,116 @@
+#!/bin/bash
+# Lid close: low power mode on, brightness 0, muted. Lid open: put back what was there before.
+#   lidmode run        the watcher (what the LaunchAgent runs)
+#   lidmode close [--force]  pretend the lid closed; --force skips the Amphetamine check
+#   lidmode open       pretend the lid opened
+#   lidmode auto       stop pretending, follow the real lid
+#   lidmode status     lid, fake state, saved state, current values
+#   lidmode uninstall  remove the agent and files (the sudoers file is printed, not removed)
+
+DIR="$HOME/.local/share/lidmode"
+STATE="${TMPDIR:-/tmp}/lidmode.state"
+FORCE="$DIR/force"
+LOG="$HOME/Library/Logs/lidmode.log"
+BRIGHT="$HOME/.local/bin/lidmode-brightness"
+LABEL="com.lidmode.agent"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+POLL=2
+
+log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
+
+lid() {
+  if [ -f "$FORCE" ]; then /usr/bin/awk '{print $1}' "$FORCE"; return; fi
+  /usr/sbin/ioreg -r -k AppleClamshellState -d 4 | /usr/bin/awk -F'= ' '/"AppleClamshellState"/{print $2; exit}'
+}
+
+# A session shows up as an assertion owned by the Amphetamine process (its name varies by
+# session type); the app running with no session holds none.
+amph() { /usr/bin/pmset -g assertions | /usr/bin/awk '/^[[:space:]]+pid [0-9]+\(Amphetamine\):/{f=1} END{exit !f}'; }
+
+# lowpowermode is stored per power source, so read and restore each one on its own.
+lpm() { /usr/bin/pmset -g custom | /usr/bin/awk -v s="$1" '/Power:/{cur=$0} /lowpowermode/{if (cur ~ s) print $2}'; }
+muted() { /usr/bin/osascript -e 'output muted of (get volume settings)'; }
+
+pm() { /usr/bin/sudo -n /usr/bin/pmset "$@" 2>/dev/null || log "pmset $* failed (sudoers file installed?)"; }
+
+on_close() {
+  if ! amph && ! grep -qs force "$FORCE"; then
+    echo "ACTED=0" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+    log "close: skipped, no Amphetamine session active"
+    return
+  fi
+  # Brightness is the last value seen while the lid was open: once the lid is shut the
+  # panel is already off and a live read can come back wrong.
+  local b="${last_bright:-$("$BRIGHT" get 2>/dev/null)}"
+  printf 'ACTED=1\nLPM_B=%s\nLPM_A=%s\nMUTED=%s\nBRIGHT=%s\n' \
+    "$(lpm Battery)" "$(lpm AC)" "$(muted)" "$b" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+  log "close: saved $(tr '\n' ' ' < "$STATE")"
+  pm -a lowpowermode 1
+  /usr/bin/osascript -e 'set volume output muted true'
+  "$BRIGHT" set 0 || log "brightness set 0 failed"
+}
+
+on_open() {
+  [ -f "$STATE" ] || { log "open: no saved state, leaving things alone"; return; }
+  local ACTED LPM_B LPM_A MUTED BRIGHT_SAVED
+  while IFS='=' read -r k v; do
+    case $k in ACTED) ACTED=$v;; LPM_B) LPM_B=$v;; LPM_A) LPM_A=$v;; MUTED) MUTED=$v;; BRIGHT) BRIGHT_SAVED=$v;; esac
+  done < "$STATE"
+  if [ "$ACTED" != "1" ]; then log "open: close was skipped, nothing to restore"; rm -f "$STATE"; return; fi
+  [ -n "$LPM_B" ] && [ "$(lpm Battery)" != "$LPM_B" ] && pm -b lowpowermode "$LPM_B"
+  [ -n "$LPM_A" ] && [ "$(lpm AC)" != "$LPM_A" ] && pm -c lowpowermode "$LPM_A"
+  [ "$MUTED" = "true" ] || [ "$MUTED" = "false" ] && /usr/bin/osascript -e "set volume output muted $MUTED"
+  if [ -n "$BRIGHT_SAVED" ]; then
+    # The panel can still be waking, so retry.
+    for _ in 1 2 3 4 5; do "$BRIGHT" set "$BRIGHT_SAVED" && break; sleep 1; done
+  fi
+  log "open: restored $(tr '\n' ' ' < "$STATE")"
+  rm -f "$STATE"
+}
+
+run() {
+  mkdir -p "$DIR"
+  local prev="No" cur v
+  # Restarted while closed: the saved state is still valid, so do not overwrite it.
+  [ -f "$STATE" ] && prev="Yes"
+  log "start (lid $(lid), state file $([ -f "$STATE" ] && echo present || echo absent))"
+  while true; do
+    cur=$(lid)
+    if [ "$cur" = "Yes" ] && [ "$prev" != "Yes" ]; then on_close
+    elif [ "$cur" = "No" ] && { [ "$prev" = "Yes" ] || [ -f "$STATE" ]; }; then on_open
+    fi
+    if [ "$cur" = "No" ]; then
+      v=$("$BRIGHT" get 2>/dev/null) && [ "$v" != "0.0000" ] && last_bright=$v
+    fi
+    prev=$cur
+    sleep "$POLL"
+  done
+}
+
+case "${1:-run}" in
+  run) run ;;
+  close) mkdir -p "$DIR"
+    if [ "$2" = "--force" ]; then echo "Yes force" > "$FORCE"; else echo Yes > "$FORCE"; fi
+    echo "fake lid: closed$([ "$2" = "--force" ] && echo ", forced"). Without a session it does nothing; with one the screen goes black. Run 'lidmode open' to restore." ;;
+  open) mkdir -p "$DIR"; echo No > "$FORCE"; echo "fake lid: open. Run 'lidmode auto' when done." ;;
+  auto) rm -f "$FORCE"; echo "following the real lid" ;;
+  status)
+    echo "real lid : $(/usr/sbin/ioreg -r -k AppleClamshellState -d 4 | /usr/bin/awk -F'= ' '/"AppleClamshellState"/{print $2; exit}')"
+    echo "fake lid : $(cat "$FORCE" 2>/dev/null || echo none)"
+    echo "amphetamine: $(amph && echo "session ACTIVE" || echo "no session")"
+    echo "low power: battery=$(lpm Battery) ac=$(lpm AC)"
+    echo "muted    : $(muted)"
+    echo "bright   : $("$BRIGHT" get 2>/dev/null || echo unreadable)"
+    echo "saved    : $([ -f "$STATE" ] && tr '\n' ' ' < "$STATE" || echo none)"
+    echo "agent    : $(launchctl list | grep "$LABEL" || echo not loaded)"
+    echo "log      : $LOG" ;;
+  uninstall)
+    if [ -f "$STATE" ]; then echo "restoring saved state first"; on_open; fi
+    launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
+    rm -f "$PLIST" "$STATE" "$HOME/.local/bin/lidmode-brightness"
+    rm -rf "$DIR"
+    echo "removed agent, brightness tool and $DIR. Log kept at $LOG."
+    echo "Remove the sudoers file yourself: sudo rm /etc/sudoers.d/lidmode"
+    rm -f "$0" ;;
+  *) sed -n '2,8p' "$0"; exit 64 ;;
+esac
